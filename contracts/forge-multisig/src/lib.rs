@@ -10,7 +10,9 @@
 //! - Owners can propose, approve, reject, and execute transactions
 //! - Native token support via Stellar token interface
 
-use soroban_sdk::{contract, contracterror, contractimpl, contracttype, token, Address, Env, Vec};
+use soroban_sdk::{
+    contract, contracterror, contractimpl, contracttype, token, Address, Env, Symbol, Vec,
+};
 
 // ── Storage keys ──────────────────────────────────────────────────────────────
 
@@ -21,6 +23,13 @@ pub enum DataKey {
     TimelockDelay,
     Proposal(u64),
     NextProposalId,
+    /// Boolean flag per address — `true` means the address is an owner.
+    /// Enables O(1) ownership checks without scanning the full owner Vec.
+    IsOwner(Address),
+    /// Boolean flag for whether an address has approved a proposal.
+    HasApproved(u64, Address),
+    /// Boolean flag for whether an address has rejected a proposal.
+    HasRejected(u64, Address),
 }
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -37,10 +46,10 @@ pub struct Proposal {
     pub token: Address,
     /// Amount to transfer.
     pub amount: i128,
-    /// Addresses that have approved.
-    pub approvals: Vec<Address>,
-    /// Addresses that have rejected.
-    pub rejections: Vec<Address>,
+    /// Number of approvals recorded for this proposal.
+    pub approval_count: u32,
+    /// Number of rejections recorded for this proposal.
+    pub rejection_count: u32,
     /// Ledger timestamp when approval threshold was reached.
     pub approved_at: Option<u64>,
     /// Whether the proposal has been executed.
@@ -65,6 +74,7 @@ pub enum MultisigError {
     InsufficientApprovals = 9,
     InvalidThreshold = 10,
     InvalidAmount = 11,
+    CannotCancel = 12,
 }
 
 // ── Contract ──────────────────────────────────────────────────────────────────
@@ -132,6 +142,14 @@ impl MultisigContract {
         env.storage()
             .instance()
             .set(&DataKey::TimelockDelay, &timelock_delay);
+
+        // Populate O(1) ownership lookup map.
+        for owner in unique_owners.iter() {
+            env.storage()
+                .instance()
+                .set(&DataKey::IsOwner(owner), &true);
+        }
+
         Ok(())
     }
 
@@ -174,27 +192,24 @@ impl MultisigContract {
 
         let proposal_id: u64 = env
             .storage()
-            .instance()
+            .persistent()
             .get(&DataKey::NextProposalId)
             .unwrap_or(0u64);
 
-        let mut approvals = Vec::new(&env);
-        approvals.push_back(proposer.clone());
-
         let threshold: u32 = env.storage().instance().get(&DataKey::Threshold).unwrap();
-        let approved_at = if approvals.len() >= threshold {
+        let approved_at = if 1 >= threshold {
             Some(env.ledger().timestamp())
         } else {
             None
         };
 
         let proposal = Proposal {
-            proposer,
-            to,
-            token,
+            proposer: proposer.clone(),
+            to: to.clone(),
+            token: token.clone(),
             amount,
-            approvals,
-            rejections: Vec::new(&env),
+            approval_count: 1,
+            rejection_count: 0,
             approved_at,
             executed: false,
             cancelled: false,
@@ -202,10 +217,24 @@ impl MultisigContract {
 
         env.storage()
             .persistent()
+            .set(&DataKey::HasApproved(proposal_id, proposer.clone()), &true);
+
+        env.storage()
+            .persistent()
             .set(&DataKey::Proposal(proposal_id), &proposal);
         env.storage()
-            .instance()
+            .persistent()
             .set(&DataKey::NextProposalId, &(proposal_id + 1));
+
+        // Extend TTL for NextProposalId to prevent expiry (1 year)
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::NextProposalId, 31536000, 31536000);
+
+        env.events().publish(
+            (Symbol::new(&env, "proposal_created"),),
+            (proposal_id, &proposer, &to, &token, amount),
+        );
 
         Ok(proposal_id)
     }
@@ -251,20 +280,43 @@ impl MultisigContract {
         if proposal.cancelled {
             return Err(MultisigError::AlreadyCancelled);
         }
-        if proposal.approvals.contains(&owner) || proposal.rejections.contains(&owner) {
+        if env
+            .storage()
+            .persistent()
+            .get::<DataKey, bool>(&DataKey::HasApproved(proposal_id, owner.clone()))
+            .unwrap_or(false)
+            || env
+                .storage()
+                .persistent()
+                .get::<DataKey, bool>(&DataKey::HasRejected(proposal_id, owner.clone()))
+                .unwrap_or(false)
+        {
             return Err(MultisigError::AlreadyVoted);
         }
 
-        proposal.approvals.push_back(owner);
+        proposal.approval_count = proposal.approval_count.saturating_add(1);
+        env.storage()
+            .persistent()
+            .set(&DataKey::HasApproved(proposal_id, owner.clone()), &true);
 
         let threshold: u32 = env.storage().instance().get(&DataKey::Threshold).unwrap();
-        if proposal.approvals.len() >= threshold && proposal.approved_at.is_none() {
+        // The is_none() guard ensures approved_at is set only once, when the threshold is first reached.
+        // This prevents the timelock countdown from being reset if threshold changes in the future.
+        // Currently, owners and threshold are immutable after initialize(), but this guard protects
+        // against accidental resets if threshold mutability is added later.
+        if proposal.approval_count >= threshold && proposal.approved_at.is_none() {
             proposal.approved_at = Some(env.ledger().timestamp());
         }
 
         env.storage()
             .persistent()
             .set(&DataKey::Proposal(proposal_id), &proposal);
+        env.storage().instance().extend_ttl(17280, 34560);
+
+        env.events().publish(
+            (Symbol::new(&env, "proposal_approved"),),
+            (proposal_id, &owner, proposal.approval_count),
+        );
 
         Ok(())
     }
@@ -306,14 +358,35 @@ impl MultisigContract {
         if proposal.executed {
             return Err(MultisigError::AlreadyExecuted);
         }
-        if proposal.approvals.contains(&owner) || proposal.rejections.contains(&owner) {
+        if proposal.cancelled {
+            return Err(MultisigError::AlreadyCancelled);
+        }
+        if env
+            .storage()
+            .persistent()
+            .get::<DataKey, bool>(&DataKey::HasApproved(proposal_id, owner.clone()))
+            .unwrap_or(false)
+            || env
+                .storage()
+                .persistent()
+                .get::<DataKey, bool>(&DataKey::HasRejected(proposal_id, owner.clone()))
+                .unwrap_or(false)
+        {
             return Err(MultisigError::AlreadyVoted);
         }
 
-        proposal.rejections.push_back(owner);
+        proposal.rejection_count = proposal.rejection_count.saturating_add(1);
+        env.storage()
+            .persistent()
+            .set(&DataKey::HasRejected(proposal_id, owner.clone()), &true);
         env.storage()
             .persistent()
             .set(&DataKey::Proposal(proposal_id), &proposal);
+
+        env.events().publish(
+            (Symbol::new(&env, "proposal_rejected"),),
+            (proposal_id, &owner, proposal.rejection_count),
+        );
 
         Ok(())
     }
@@ -386,8 +459,101 @@ impl MultisigContract {
             &proposal.to,
             &proposal.amount,
         );
+        env.storage().instance().extend_ttl(17280, 34560);
+
+        env.events().publish(
+            (Symbol::new(&env, "proposal_executed"),),
+            (proposal_id, &executor, &proposal.to, proposal.amount),
+        );
 
         Ok(())
+    }
+
+    /// Cancel a proposal that can no longer reach the approval threshold.
+    ///
+    /// Allows an owner to cancel a proposal if it is mathematically impossible
+    /// for it to reach the approval threshold, or if the proposer cancels before
+    /// execution. This helps clean up dead proposals and free storage.
+    /// Requires authorization from `owner`.
+    ///
+    /// # Parameters
+    /// - `owner` — An owner address requesting cancellation.
+    /// - `proposal_id` — ID of the proposal to cancel.
+    ///
+    /// # Returns
+    /// `Ok(())` on success.
+    ///
+    /// # Errors
+    /// - [`MultisigError::Unauthorized`] — `owner` is not in the owner list.
+    /// - [`MultisigError::ProposalNotFound`] — No proposal exists with `proposal_id`.
+    /// - [`MultisigError::AlreadyExecuted`] — The proposal has already been executed.
+    /// - [`MultisigError::AlreadyCancelled`] — The proposal has already been cancelled.
+    /// - [`MultisigError::CannotCancel`] — The proposal can still reach the approval threshold.
+    ///
+    /// # Example
+    /// ```text
+    /// // Cancel a proposal that can no longer reach threshold
+    /// client.cancel(&owner_a, &proposal_id);
+    /// ```
+    pub fn cancel(env: Env, owner: Address, proposal_id: u64) -> Result<(), MultisigError> {
+        owner.require_auth();
+        Self::require_owner(&env, &owner)?;
+
+        let mut proposal: Proposal = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Proposal(proposal_id))
+            .ok_or(MultisigError::ProposalNotFound)?;
+
+        if proposal.executed {
+            return Err(MultisigError::AlreadyExecuted);
+        }
+        if proposal.cancelled {
+            return Err(MultisigError::AlreadyCancelled);
+        }
+
+        // Allow proposer to cancel at any time before execution
+        if proposal.proposer == owner {
+            proposal.cancelled = true;
+            env.storage()
+                .persistent()
+                .set(&DataKey::Proposal(proposal_id), &proposal);
+
+            env.events().publish(
+                (Symbol::new(&env, "proposal_cancelled"),),
+                (proposal_id, &owner),
+            );
+
+            return Ok(());
+        }
+
+        // For other owners, only allow cancellation if mathematically impossible to pass
+        let threshold: u32 = env.storage().instance().get(&DataKey::Threshold).unwrap();
+        let owners: Vec<Address> = env.storage().instance().get(&DataKey::Owners).unwrap();
+        let total_owners = owners.len();
+
+        // Calculate remaining possible approvals
+        // remaining_possible = total_owners - rejection_count - approval_count
+        let remaining_possible = total_owners
+            .saturating_sub(proposal.rejection_count)
+            .saturating_sub(proposal.approval_count);
+
+        // If remaining possible approvals < threshold, it's impossible to pass
+        if remaining_possible < threshold {
+            proposal.cancelled = true;
+            env.storage()
+                .persistent()
+                .set(&DataKey::Proposal(proposal_id), &proposal);
+
+            env.events().publish(
+                (Symbol::new(&env, "proposal_cancelled"),),
+                (proposal_id, &owner),
+            );
+
+            return Ok(());
+        }
+
+        Err(MultisigError::CannotCancel)
     }
 
     /// Return a proposal by its ID.
@@ -404,7 +570,7 @@ impl MultisigContract {
     /// # Example
     /// ```text
     /// if let Some(p) = client.get_proposal(&id) {
-    ///     println!("approvals: {}", p.approvals.len());
+    ///     println!("approvals: {}", p.approval_count);
     /// }
     /// ```
     pub fn get_proposal(env: Env, proposal_id: u64) -> Option<Proposal> {
@@ -458,6 +624,27 @@ impl MultisigContract {
             .unwrap_or(0)
     }
 
+    /// Return the configured timelock delay in seconds.
+    ///
+    /// Read-only; returns `0` if the contract has not been initialized.
+    /// This is the number of seconds that must elapse after a proposal reaches
+    /// the approval threshold before it can be executed.
+    ///
+    /// # Returns
+    /// `u64` — the timelock delay in seconds set at initialization.
+    ///
+    /// # Example
+    /// ```text
+    /// let delay = client.get_timelock_delay();
+    /// println!("Timelock: {} seconds", delay);
+    /// ```
+    pub fn get_timelock_delay(env: Env) -> u64 {
+        env.storage()
+            .instance()
+            .get(&DataKey::TimelockDelay)
+            .unwrap_or(0)
+    }
+
     /// Check if an address is one of the multisig owners.
     ///
     /// Read-only; returns `false` if the contract has not been initialized.
@@ -477,12 +664,10 @@ impl MultisigContract {
     /// }
     /// ```
     pub fn is_owner(env: Env, address: Address) -> bool {
-        let owners: Vec<Address> = env
-            .storage()
+        env.storage()
             .instance()
-            .get(&DataKey::Owners)
-            .unwrap_or(Vec::new(&env));
-        owners.contains(&address)
+            .get::<DataKey, bool>(&DataKey::IsOwner(address))
+            .unwrap_or(false)
     }
 
     /// Return the number of owner approvals for a proposal.
@@ -499,19 +684,23 @@ impl MultisigContract {
         env.storage()
             .persistent()
             .get::<DataKey, Proposal>(&DataKey::Proposal(proposal_id))
-            .map(|proposal| proposal.approvals.len())
+            .map(|proposal| proposal.approval_count)
             .unwrap_or(0)
     }
 
     // ── Private ───────────────────────────────────────────────────────────────
 
     fn require_owner(env: &Env, address: &Address) -> Result<(), MultisigError> {
-        let owners: Vec<Address> = env
+        // Guard against calls before initialize() — IsOwner keys only exist post-init.
+        if !env.storage().instance().has(&DataKey::Owners) {
+            return Err(MultisigError::NotInitialized);
+        }
+        let is_owner: bool = env
             .storage()
             .instance()
-            .get(&DataKey::Owners)
-            .ok_or(MultisigError::NotInitialized)?;
-        if owners.contains(address) {
+            .get(&DataKey::IsOwner(address.clone()))
+            .unwrap_or(false);
+        if is_owner {
             Ok(())
         } else {
             Err(MultisigError::Unauthorized)
@@ -549,6 +738,15 @@ mod tests {
         let o1 = Address::generate(&env);
         let result = client.try_initialize(&vec![&env, o1], &5, &0);
         assert_eq!(result, Err(Ok(MultisigError::InvalidThreshold)));
+    }
+
+    #[test]
+    fn test_get_timelock_delay() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _, _, _) = setup_2of3(&env);
+        // setup_2of3 initializes with timelock_delay = 3600
+        assert_eq!(client.get_timelock_delay(), 3600);
     }
 
     #[test]
@@ -687,6 +885,41 @@ mod tests {
     }
 
     #[test]
+    fn test_approve_after_execute_reverts_with_already_executed() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().with_mut(|l| l.timestamp = 0);
+
+        let contract_id = env.register_contract(None, MultisigContract);
+        let client = MultisigContractClient::new(&env, &contract_id);
+        let o1 = Address::generate(&env);
+        let o2 = Address::generate(&env);
+        let o3 = Address::generate(&env);
+        client.initialize(&vec![&env, o1.clone(), o2.clone(), o3.clone()], &2, &3600);
+
+        let token_admin = Address::generate(&env);
+        let token_id = env
+            .register_stellar_asset_contract_v2(token_admin)
+            .address();
+        let to = Address::generate(&env);
+        soroban_sdk::token::StellarAssetClient::new(&env, &token_id).mint(&contract_id, &500);
+
+        let pid = client.propose(&o1, &to, &token_id, &500);
+        client.approve(&o2, &pid);
+
+        env.ledger().with_mut(|l| l.timestamp = 7200);
+        client.execute(&o3, &pid);
+
+        // Try to approve with o3 (who hasn't voted yet) after execution
+        let result = client.try_approve(&o3, &pid);
+        assert_eq!(result, Err(Ok(MultisigError::AlreadyExecuted)));
+
+        // Also test reject() on executed proposal
+        let result = client.try_reject(&o3, &pid);
+        assert_eq!(result, Err(Ok(MultisigError::AlreadyExecuted)));
+    }
+
+    #[test]
     fn test_get_approval_count_zero() {
         let env = Env::default();
         env.mock_all_auths();
@@ -758,15 +991,15 @@ mod tests {
 
         // Verify proposal has 2 rejections
         let proposal = client.get_proposal(&pid).unwrap();
-        assert_eq!(proposal.rejections.len(), 2);
-        assert_eq!(proposal.approvals.len(), 1); // only proposer
+        assert_eq!(proposal.rejection_count, 2);
+        assert_eq!(proposal.approval_count, 1); // only proposer
 
         // Even if o4 approves, bringing total approvals to 2, it should not be executable
         // because 2 rejections means threshold of 3 can never be reached
         client.approve(&o4, &pid);
 
         let proposal = client.get_proposal(&pid).unwrap();
-        assert_eq!(proposal.approvals.len(), 2);
+        assert_eq!(proposal.approval_count, 2);
 
         // Advance time past timelock
         env.ledger().with_mut(|l| l.timestamp = 7200);
@@ -778,7 +1011,7 @@ mod tests {
         // Verify proposal state remains unchanged
         let proposal = client.get_proposal(&pid).unwrap();
         assert!(!proposal.executed);
-        assert_eq!(proposal.rejections.len(), 2);
+        assert_eq!(proposal.rejection_count, 2);
     }
 
     #[test]
@@ -799,13 +1032,13 @@ mod tests {
 
         // Verify rejection state
         let proposal = client.get_proposal(&pid).unwrap();
-        assert_eq!(proposal.rejections.len(), 2);
-        assert_eq!(proposal.approvals.len(), 1);
+        assert_eq!(proposal.rejection_count, 2);
+        assert_eq!(proposal.approval_count, 1);
         assert!(proposal.approved_at.is_none()); // Never reached approval threshold
 
         // Proposal should remain in rejected state
         let proposal_after = client.get_proposal(&pid).unwrap();
-        assert_eq!(proposal_after.rejections.len(), 2);
+        assert_eq!(proposal_after.rejection_count, 2);
         assert!(!proposal_after.executed);
     }
 
@@ -834,7 +1067,11 @@ mod tests {
         let o1 = Address::generate(env);
         let o2 = Address::generate(env);
         let o3 = Address::generate(env);
-        client.initialize(&vec![env, o1.clone(), o2.clone(), o3.clone()], &2, &timelock_delay);
+        client.initialize(
+            &vec![env, o1.clone(), o2.clone(), o3.clone()],
+            &2,
+            &timelock_delay,
+        );
 
         let token_id = env
             .register_stellar_asset_contract_v2(Address::generate(env))
@@ -939,6 +1176,35 @@ mod tests {
         assert!(owners.contains(&o3));
     }
 
+    /// Test that get_owner_list() and get_owners() return identical results.
+    /// get_owner_list() is documented as an alias for get_owners() and simply delegates to it.
+    /// This test verifies the delegation is correct and both functions return identical results.
+    #[test]
+    fn test_get_owner_list_and_get_owners_return_identical_results() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, o1, o2, o3) = setup_2of3(&env);
+
+        let owners = client.get_owners();
+        let owner_list = client.get_owner_list();
+
+        // Assert same length
+        assert_eq!(owners.len(), owner_list.len());
+
+        // Assert same elements in same order
+        for i in 0..owners.len() {
+            assert_eq!(owners.get(i).unwrap(), owner_list.get(i).unwrap());
+        }
+
+        // Assert all expected owners are present
+        assert!(owners.contains(&o1));
+        assert!(owners.contains(&o2));
+        assert!(owners.contains(&o3));
+        assert!(owner_list.contains(&o1));
+        assert!(owner_list.contains(&o2));
+        assert!(owner_list.contains(&o3));
+    }
+
     // ── 1-of-N threshold tests ─────────────────────────────────────────────────
     //
     // A threshold of 1 means any single owner can unilaterally authorize a
@@ -949,7 +1215,14 @@ mod tests {
     /// Helper: 1-of-3 multisig with a 3600 s timelock and a funded token.
     fn setup_1of3_funded<'a>(
         env: &'a Env,
-    ) -> (MultisigContractClient<'a>, Address, Address, Address, Address, Address) {
+    ) -> (
+        MultisigContractClient<'a>,
+        Address,
+        Address,
+        Address,
+        Address,
+        Address,
+    ) {
         let contract_id = env.register_contract(None, MultisigContract);
         let client = MultisigContractClient::new(env, &contract_id);
         let o1 = Address::generate(env);
@@ -977,7 +1250,7 @@ mod tests {
         // propose auto-approves for proposer — threshold=1 is immediately met
         let pid = client.propose(&o1, &recipient, &token_id, &100);
         let proposal = client.get_proposal(&pid).unwrap();
-        assert_eq!(proposal.approvals.len(), 1);
+        assert_eq!(proposal.approval_count, 1);
         assert!(proposal.approved_at.is_some()); // threshold reached at proposal time
 
         // advance past timelock and execute
@@ -1005,7 +1278,7 @@ mod tests {
         client.reject(&o3, &pid);
         let proposal = client.get_proposal(&pid).unwrap();
         assert!(proposal.approved_at.is_some()); // still approved
-        assert_eq!(proposal.rejections.len(), 1);
+        assert_eq!(proposal.rejection_count, 1);
 
         // execution still succeeds after timelock
         env.ledger().with_mut(|l| l.timestamp = 3601);
@@ -1038,6 +1311,8 @@ mod tests {
 
         let result = client.try_propose(&non_owner, &recipient, &token_id, &100);
         assert_eq!(result, Err(Ok(MultisigError::Unauthorized)));
+    }
+
     // ── Non-owner propose() rejection ─────────────────────────────────────────
 
     #[test]
@@ -1086,5 +1361,415 @@ mod tests {
         assert!(client.get_proposal(&0).is_none());
         // Approval count for a non-existent proposal returns 0
         assert_eq!(client.get_approval_count(&0), 0);
+    }
+
+    // ── Token balance verification after execute() ────────────────────────────
+
+    /// After a proposal is approved, the timelock elapses, and execute() is called,
+    /// the recipient's token balance must increase by exactly the proposed amount,
+    /// and the multisig contract's balance must decrease by the same amount.
+    #[test]
+    fn test_execute_transfers_exact_token_amount_to_recipient() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().with_mut(|l| l.timestamp = 0);
+
+        // Step 1: Fund the multisig contract with tokens
+        const TIMELOCK: u64 = 3600;
+        const TRANSFER_AMOUNT: i128 = 250;
+        const FUNDED_AMOUNT: i128 = 1000;
+
+        let (client, [o1, o2, o3], token_id, recipient, contract_id) = setup_funded(&env, TIMELOCK);
+
+        let token = soroban_sdk::token::Client::new(&env, &token_id);
+
+        // Verify initial balances
+        let initial_contract_balance = token.balance(&contract_id);
+        let initial_recipient_balance = token.balance(&recipient);
+        assert_eq!(initial_contract_balance, FUNDED_AMOUNT);
+        assert_eq!(initial_recipient_balance, 0);
+
+        // Step 2: Propose a transfer of a specific amount to the recipient
+        let pid = client.propose(&o1, &recipient, &token_id, &TRANSFER_AMOUNT);
+
+        // Step 3: Approve to reach the 2-of-3 threshold
+        client.approve(&o2, &pid);
+
+        // Step 4: Advance past the timelock and execute
+        env.ledger().with_mut(|l| l.timestamp = TIMELOCK + 1);
+        client.execute(&o3, &pid);
+
+        // Step 5: Verify recipient balance increased by exactly the proposed amount
+        let final_recipient_balance = token.balance(&recipient);
+        assert_eq!(
+            final_recipient_balance,
+            initial_recipient_balance + TRANSFER_AMOUNT,
+            "recipient balance must increase by exactly the proposed amount"
+        );
+
+        // Step 6: Verify multisig balance decreased by the same amount
+        let final_contract_balance = token.balance(&contract_id);
+        assert_eq!(
+            final_contract_balance,
+            initial_contract_balance - TRANSFER_AMOUNT,
+            "multisig balance must decrease by exactly the proposed amount"
+        );
+
+        // Sanity check: no tokens created or destroyed
+        assert_eq!(
+            final_recipient_balance + final_contract_balance,
+            FUNDED_AMOUNT
+        );
+    }
+
+    /// Test that propose() emits a proposal_created event with correct payload
+    #[test]
+    fn test_propose_emits_event() {
+        use soroban_sdk::testutils::Events;
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, o1, _, _) = setup_2of3(&env);
+        let token = Address::generate(&env);
+        let to = Address::generate(&env);
+
+        let pid = client.propose(&o1, &to, &token, &500);
+
+        let events = env.events().all();
+        let found = events.iter().any(|(_, topics, data)| {
+            topics
+                .get(0)
+                .and_then(|t| Symbol::try_from_val(&env, &t).ok())
+                .map(|s| s == Symbol::new(&env, "proposal_created"))
+                .unwrap_or(false)
+                && <(u64, Address, Address, Address, i128)>::try_from_val(&env, &data)
+                    .map(|(id, proposer, recipient, tok, amt)| {
+                        id == pid && proposer == o1 && recipient == to && tok == token && amt == 500
+                    })
+                    .unwrap_or(false)
+        });
+        assert!(found, "Expected proposal_created event not found");
+    }
+
+    /// Test for issue #213: In a 1-of-3 multisig, approved_at is set during propose()
+    /// (when proposer's auto-approval meets threshold) and is not overwritten by subsequent approve() calls.
+    #[test]
+    fn test_1of3_approved_at_set_at_propose_not_overwritten() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().with_mut(|l| l.timestamp = 1000);
+
+        let (client, o1, o2, o3) = setup_1of3_funded(&env);
+        let token = Address::generate(&env);
+        let to = Address::generate(&env);
+
+        // propose() auto-approves proposer; threshold=1 is met immediately
+        let pid = client.propose(&o1, &to, &token, &100);
+        let proposal_after_propose = client.get_proposal(&pid).unwrap();
+        assert_eq!(proposal_after_propose.approval_count, 1);
+        let approved_at_from_propose = proposal_after_propose.approved_at;
+        assert_eq!(approved_at_from_propose, Some(1000));
+
+        // Advance time and have another owner approve
+        env.ledger().with_mut(|l| l.timestamp = 2000);
+        client.approve(&o2, &pid);
+
+        // Verify approved_at was NOT overwritten
+        let proposal_after_approve = client.get_proposal(&pid).unwrap();
+        assert_eq!(proposal_after_approve.approval_count, 2);
+        assert_eq!(
+            proposal_after_approve.approved_at, approved_at_from_propose,
+            "approved_at must not be overwritten by subsequent approve()"
+        );
+        assert_eq!(proposal_after_approve.approved_at, Some(1000));
+
+        // Verify a third approval also doesn't change approved_at
+        env.ledger().with_mut(|l| l.timestamp = 3000);
+        client.approve(&o3, &pid);
+        let proposal_after_third_approve = client.get_proposal(&pid).unwrap();
+        assert_eq!(proposal_after_third_approve.approved_at, Some(1000));
+    }
+
+    /// Test that approve() emits a proposal_approved event with correct payload
+    #[test]
+    fn test_approve_emits_event() {
+        use soroban_sdk::testutils::Events;
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, o1, o2, _) = setup_2of3(&env);
+        let token = Address::generate(&env);
+        let to = Address::generate(&env);
+
+        let pid = client.propose(&o1, &to, &token, &500);
+        client.approve(&o2, &pid);
+
+        let events = env.events().all();
+        let found = events.iter().any(|(_, topics, data)| {
+            topics
+                .get(0)
+                .and_then(|t| Symbol::try_from_val(&env, &t).ok())
+                .map(|s| s == Symbol::new(&env, "proposal_approved"))
+                .unwrap_or(false)
+                && <(u64, Address, u32)>::try_from_val(&env, &data)
+                    .map(|(id, owner, count)| id == pid && owner == o2 && count == 2)
+                    .unwrap_or(false)
+        });
+        assert!(found, "Expected proposal_approved event not found");
+    }
+
+    /// Test that reject() emits a proposal_rejected event with correct payload
+    #[test]
+    fn test_reject_emits_event() {
+        use soroban_sdk::testutils::Events;
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, o1, o2, _) = setup_2of3(&env);
+        let token = Address::generate(&env);
+        let to = Address::generate(&env);
+
+        let pid = client.propose(&o1, &to, &token, &500);
+        client.reject(&o2, &pid);
+
+        let events = env.events().all();
+        let found = events.iter().any(|(_, topics, data)| {
+            topics
+                .get(0)
+                .and_then(|t| Symbol::try_from_val(&env, &t).ok())
+                .map(|s| s == Symbol::new(&env, "proposal_rejected"))
+                .unwrap_or(false)
+                && <(u64, Address, u32)>::try_from_val(&env, &data)
+                    .map(|(id, owner, count)| id == pid && owner == o2 && count == 1)
+                    .unwrap_or(false)
+        });
+        assert!(found, "Expected proposal_rejected event not found");
+    }
+
+    /// Test that reject() on a cancelled proposal reverts with AlreadyCancelled
+    #[test]
+    fn test_reject_on_cancelled_proposal_reverts() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, o1, o2, o3) = setup_2of3(&env);
+        let token = Address::generate(&env);
+        let to = Address::generate(&env);
+
+        let pid = client.propose(&o1, &to, &token, &500);
+
+        // Cancel the proposal
+        client.cancel(&o1, &pid);
+
+        // Try to reject the cancelled proposal
+        let result = client.try_reject(&o2, &pid);
+        assert_eq!(result, Err(Ok(MultisigError::AlreadyCancelled)));
+
+        // Verify proposal is still cancelled
+        let proposal = client.get_proposal(&pid).unwrap();
+        assert!(proposal.cancelled);
+    }
+
+    /// Test that proposer can cancel their own proposal before execution
+    #[test]
+    fn test_proposer_can_cancel_own_proposal() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, o1, o2, o3) = setup_2of3(&env);
+        let token = Address::generate(&env);
+        let to = Address::generate(&env);
+
+        let pid = client.propose(&o1, &to, &token, &500);
+
+        // Proposer cancels their own proposal
+        let result = client.try_cancel(&o1, &pid);
+        assert!(result.is_ok());
+
+        // Verify proposal is cancelled
+        let proposal = client.get_proposal(&pid).unwrap();
+        assert!(proposal.cancelled);
+    }
+
+    /// Test that non-proposer can cancel a proposal that can no longer reach threshold
+    #[test]
+    fn test_non_proposer_can_cancel_dead_proposal() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, o1, o2, o3) = setup_2of3(&env);
+        let token = Address::generate(&env);
+        let to = Address::generate(&env);
+
+        let pid = client.propose(&o1, &to, &token, &500);
+
+        // o2 rejects, making it impossible to reach threshold (2 approvals needed, only 1 possible)
+        client.reject(&o2, &pid);
+
+        // o3 can cancel because remaining possible approvals (1) < threshold (2)
+        let result = client.try_cancel(&o3, &pid);
+        assert!(result.is_ok());
+
+        // Verify proposal is cancelled
+        let proposal = client.get_proposal(&pid).unwrap();
+        assert!(proposal.cancelled);
+    }
+
+    /// Test that non-proposer cannot cancel a proposal that can still reach threshold
+    #[test]
+    fn test_non_proposer_cannot_cancel_active_proposal() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, o1, o2, o3) = setup_2of3(&env);
+        let token = Address::generate(&env);
+        let to = Address::generate(&env);
+
+        let pid = client.propose(&o1, &to, &token, &500);
+
+        // o2 tries to cancel, but proposal can still reach threshold
+        let result = client.try_cancel(&o2, &pid);
+        assert_eq!(result, Err(Ok(MultisigError::CannotCancel)));
+
+        // Verify proposal is not cancelled
+        let proposal = client.get_proposal(&pid).unwrap();
+        assert!(!proposal.cancelled);
+    }
+
+    /// Test that cancel() on an already cancelled proposal reverts with AlreadyCancelled
+    #[test]
+    fn test_cancel_already_cancelled_proposal_reverts() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, o1, o2, o3) = setup_2of3(&env);
+        let token = Address::generate(&env);
+        let to = Address::generate(&env);
+
+        let pid = client.propose(&o1, &to, &token, &500);
+
+        // Cancel the proposal
+        client.cancel(&o1, &pid);
+
+        // Try to cancel again
+        let result = client.try_cancel(&o1, &pid);
+        assert_eq!(result, Err(Ok(MultisigError::AlreadyCancelled)));
+    }
+
+    /// Test that cancel() on an executed proposal reverts with AlreadyExecuted
+    #[test]
+    fn test_cancel_executed_proposal_reverts() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().with_mut(|l| l.timestamp = 0);
+
+        let contract_id = env.register_contract(None, MultisigContract);
+        let client = MultisigContractClient::new(&env, &contract_id);
+        let o1 = Address::generate(&env);
+        let o2 = Address::generate(&env);
+        let o3 = Address::generate(&env);
+        client.initialize(&vec![&env, o1.clone(), o2.clone(), o3.clone()], &2, &3600);
+
+        let token_admin = Address::generate(&env);
+        let token_id = env
+            .register_stellar_asset_contract_v2(token_admin)
+            .address();
+        let to = Address::generate(&env);
+        soroban_sdk::token::StellarAssetClient::new(&env, &token_id).mint(&contract_id, &500);
+
+        let pid = client.propose(&o1, &to, &token_id, &500);
+        client.approve(&o2, &pid);
+
+        env.ledger().with_mut(|l| l.timestamp = 7200);
+        client.execute(&o3, &pid);
+
+        // Try to cancel the executed proposal
+        let result = client.try_cancel(&o1, &pid);
+        assert_eq!(result, Err(Ok(MultisigError::AlreadyExecuted)));
+    }
+
+    /// Test that execute() emits a proposal_executed event with correct payload
+    #[test]
+    fn test_execute_emits_event() {
+        use soroban_sdk::testutils::Events;
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().with_mut(|l| l.timestamp = 0);
+
+        let contract_id = env.register_contract(None, MultisigContract);
+        let client = MultisigContractClient::new(&env, &contract_id);
+        let o1 = Address::generate(&env);
+        let o2 = Address::generate(&env);
+        let o3 = Address::generate(&env);
+        client.initialize(&vec![&env, o1.clone(), o2.clone(), o3.clone()], &2, &3600);
+
+        let token_admin = Address::generate(&env);
+        let token_id = env
+            .register_stellar_asset_contract_v2(token_admin)
+            .address();
+        let to = Address::generate(&env);
+        soroban_sdk::token::StellarAssetClient::new(&env, &token_id).mint(&contract_id, &500);
+
+        let pid = client.propose(&o1, &to, &token_id, &500);
+        client.approve(&o2, &pid);
+
+        env.ledger().with_mut(|l| l.timestamp = 7200);
+        client.execute(&o3, &pid);
+
+        let events = env.events().all();
+        let found = events.iter().any(|(_, topics, data)| {
+            topics
+                .get(0)
+                .and_then(|t| Symbol::try_from_val(&env, &t).ok())
+                .map(|s| s == Symbol::new(&env, "proposal_executed"))
+                .unwrap_or(false)
+                && <(u64, Address, Address, i128)>::try_from_val(&env, &data)
+                    .map(|(id, executor, recipient, amt)| {
+                        id == pid && executor == o3 && recipient == to && amt == 500
+                    })
+                    .unwrap_or(false)
+        });
+        assert!(found, "Expected proposal_executed event not found");
+    }
+
+    /// Test that ownership checks are correct with a large owner set (10 owners).
+    /// Verifies O(1) IsOwner map correctly identifies owners and non-owners.
+    #[test]
+    fn test_large_owner_set_ownership_checks() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let contract_id = env.register_contract(None, MultisigContract);
+        let client = MultisigContractClient::new(&env, &contract_id);
+
+        // Generate 10 owners
+        let owners: std::vec::Vec<Address> = (0..10).map(|_| Address::generate(&env)).collect();
+        let sdk_owners = {
+            let mut v = soroban_sdk::Vec::new(&env);
+            for o in owners.iter() {
+                v.push_back(o.clone());
+            }
+            v
+        };
+
+        // 6-of-10 multisig
+        client.initialize(&sdk_owners, &6, &0);
+
+        // All 10 owners must be recognised
+        for owner in owners.iter() {
+            assert!(client.is_owner(owner), "Expected address to be an owner");
+        }
+
+        // A freshly generated address must NOT be an owner
+        let non_owner = Address::generate(&env);
+        assert!(
+            !client.is_owner(&non_owner),
+            "Expected address to not be an owner"
+        );
+
+        // get_owners() must still return all 10
+        assert_eq!(client.get_owners().len(), 10);
+
+        // A non-owner cannot propose (Unauthorized)
+        let token = Address::generate(&env);
+        let to = Address::generate(&env);
+        let result = client.try_propose(&non_owner, &to, &token, &100);
+        assert_eq!(result, Err(Ok(MultisigError::Unauthorized)));
+
+        // An owner can propose successfully
+        let result = client.try_propose(&owners[0], &to, &token, &100);
+        assert!(result.is_ok());
     }
 }
